@@ -1,9 +1,16 @@
 import type { LlmConfig, ReasoningConfig } from "@/stores/wiki-store"
+import { computeContextBudget } from "@/lib/context-budget"
 import {
   AZURE_OPENAI_API_VERSION,
   buildAzureOpenAiUrl,
   isAzureOpenAiEndpoint,
 } from "@/lib/azure-openai"
+import {
+  isAdaptiveAnthropicModel,
+  isGeminiThinkingLevelModel,
+  isOpenRouterEndpoint,
+  normalizeReasoningForProvider,
+} from "@/lib/reasoning-capabilities"
 
 /**
  * One piece of a multimodal message body. Text + image is the only
@@ -62,9 +69,36 @@ interface ProviderConfig {
   headers: Record<string, string>
   buildBody: (messages: ChatMessage[], overrides?: RequestOverrides) => unknown
   parseStream: (line: string) => string | null
+  parseResponse: (payload: unknown) => string
+  streaming: boolean
 }
 
 const JSON_CONTENT_TYPE = "application/json"
+const HTTP_HEADER_NAME_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/
+
+/**
+ * Merge user-supplied gateway headers with protocol headers. Names are
+ * compared case-insensitively so a differently-cased duplicate cannot bypass
+ * authentication precedence. Invalid names and CR/LF values are ignored at
+ * this boundary because persisted settings may predate UI validation.
+ */
+export function mergeLlmRequestHeaders(
+  custom: Record<string, string> | undefined,
+  required: Record<string, string>,
+): Record<string, string> {
+  const merged = new Map<string, [string, string]>()
+  for (const [name, value] of Object.entries(custom ?? {})) {
+    const trimmedName = name.trim()
+    const trimmedValue = value.trim()
+    if (!HTTP_HEADER_NAME_RE.test(trimmedName) || !trimmedValue || /[\r\n]/.test(trimmedValue)) continue
+    merged.set(trimmedName.toLowerCase(), [trimmedName, trimmedValue])
+  }
+  for (const [name, value] of Object.entries(required)) {
+    if (!value) continue
+    merged.set(name.toLowerCase(), [name, value])
+  }
+  return Object.fromEntries(merged.values())
+}
 
 /**
  * Origin header for local-LLM endpoints (Ollama, LM Studio, llama.cpp
@@ -114,13 +148,32 @@ const JSON_CONTENT_TYPE = "application/json"
  * `src-tauri/Cargo.toml` lets reqwest forward Origin without
  * stripping it. End-to-end our value wins.
  */
-function localLlmOriginHeader(): Record<string, string> {
+export function localLlmOriginHeader(): Record<string, string> {
   return { Origin: "http://localhost" }
 }
 
+export function isLocalOrPrivateHttpEndpoint(endpoint: string): boolean {
+  try {
+    const url = new URL(endpoint)
+    const host = url.hostname.toLowerCase()
+    if (host === "localhost" || host.endsWith(".localhost")) return true
+    if (host === "127.0.0.1" || host === "::1" || host === "[::1]") return true
+    if (/^10\./.test(host)) return true
+    if (/^192\.168\./.test(host)) return true
+    const m = host.match(/^172\.(\d+)\./)
+    if (m) {
+      const second = Number(m[1])
+      if (second >= 16 && second <= 31) return true
+    }
+    return false
+  } catch {
+    return false
+  }
+}
+
 function parseOpenAiLine(line: string): string | null {
-  if (!line.startsWith("data: ")) return null
-  const data = line.slice(6).trim()
+  if (!line.startsWith("data:")) return null
+  const data = line.slice(5).trim()
   if (data === "[DONE]") return null
   try {
     const parsed = JSON.parse(data) as {
@@ -132,20 +185,75 @@ function parseOpenAiLine(line: string): string | null {
   }
 }
 
-function parseAnthropicLine(line: string): string | null {
-  if (!line.startsWith("data: ")) return null
-  const data = line.slice(6).trim()
+function textFromUnknownContent(content: unknown): string {
+  if (typeof content === "string") return content
+  if (!Array.isArray(content)) return ""
+  return content
+    .map((part) => {
+      if (!part || typeof part !== "object") return ""
+      const value = part as Record<string, unknown>
+      return typeof value.text === "string" ? value.text : ""
+    })
+    .join("")
+}
+
+export function parseOpenAiResponse(payload: unknown): string {
+  const root = payload as { choices?: Array<{ message?: { content?: unknown } }> }
+  return textFromUnknownContent(root?.choices?.[0]?.message?.content)
+}
+
+export function parseAnthropicResponse(payload: unknown): string {
+  const root = payload as { content?: unknown }
+  return textFromUnknownContent(root?.content)
+}
+
+export function parseGoogleResponse(payload: unknown): string {
+  const root = payload as {
+    candidates?: Array<{ content?: { parts?: Array<{ text?: string; thought?: boolean }> } }>
+  }
+  return (root?.candidates?.[0]?.content?.parts ?? [])
+    .filter((part) => !part.thought)
+    .map((part) => part.text ?? "")
+    .join("")
+}
+
+export function parseAnthropicLine(line: string): string | null {
+  if (!line.startsWith("data:")) return null
+  const data = line.slice(5).trim()
+  if (data === "[DONE]") return null
   try {
-    const parsed = JSON.parse(data) as {
-      type: string
-      delta?: { type: string; text?: string }
-    }
+    const parsed = JSON.parse(data) as Record<string, unknown>
+
+    // Standard Anthropic streaming: content_block_delta with text_delta
+    const delta = parsed.delta as Record<string, unknown> | undefined
     if (
       parsed.type === "content_block_delta" &&
-      parsed.delta?.type === "text_delta"
+      (delta?.type === "text_delta" || typeof delta?.text === "string")
     ) {
-      return parsed.delta.text ?? null
+      return (delta.text as string) ?? null
     }
+
+    // Some third-party Anthropic-compatible gateways (e.g. Kimi/Moonshot)
+    // emit the complete assistant message as a single SSE event instead
+    // of incremental content_block_delta chunks.
+    if (
+      parsed.type === "message" &&
+      Array.isArray(parsed.content)
+    ) {
+      const text = (parsed.content as Array<Record<string, unknown>>)
+        .map((block) => typeof block.text === "string" ? block.text : "")
+        .join("")
+      return text.length > 0 ? text : null
+    }
+
+    // Fallback: misconfigured proxies occasionally return OpenAI-shaped
+    // chunks on an Anthropic wire. Extract delta.content when present.
+    const choices = parsed.choices as Array<Record<string, unknown>> | undefined
+    if (choices && choices[0]) {
+      const choiceDelta = choices[0].delta as Record<string, unknown> | undefined
+      if (typeof choiceDelta?.content === "string") return choiceDelta.content
+    }
+
     return null
   } catch {
     return null
@@ -153,8 +261,8 @@ function parseAnthropicLine(line: string): string | null {
 }
 
 export function parseGoogleLine(line: string): string | null {
-  if (!line.startsWith("data: ")) return null
-  const data = line.slice(6).trim()
+  if (!line.startsWith("data:")) return null
+  const data = line.slice(5).trim()
   try {
     const parsed = JSON.parse(data) as {
       candidates: Array<{
@@ -216,6 +324,7 @@ function toOpenAiContent(content: string | ContentBlock[]): unknown {
 function buildOpenAiBody(
   messages: ChatMessage[],
   overrides?: RequestOverrides,
+  streaming = true,
 ): Record<string, unknown> {
   // OpenAI (and every /v1/chat/completions clone — DeepSeek, Groq,
   // Ollama, Zhipu, Kimi, xAI, MiniMax OpenAI-compat, ...) accepts these
@@ -224,7 +333,7 @@ function buildOpenAiBody(
     role: m.role,
     content: toOpenAiContent(m.content),
   }))
-  return { messages: translated, stream: true, ...stripWireAgnosticOverrides(overrides) }
+  return { messages: translated, stream: streaming, ...stripWireAgnosticOverrides(overrides) }
 }
 
 function stripWireAgnosticOverrides(overrides?: RequestOverrides): Omit<RequestOverrides, "reasoning"> {
@@ -233,26 +342,39 @@ function stripWireAgnosticOverrides(overrides?: RequestOverrides): Omit<RequestO
 }
 
 function effectiveReasoning(config: LlmConfig, overrides?: RequestOverrides): ReasoningConfig {
-  return overrides?.reasoning ?? config.reasoning ?? { mode: "auto" }
+  return normalizeReasoningForProvider(
+    config,
+    overrides?.reasoning ?? config.reasoning ?? { mode: "auto" },
+  )
 }
 
 function isDeepSeekEndpoint(config: LlmConfig): boolean {
-  return /deepseek/i.test(config.model) || /deepseek/i.test(config.customEndpoint)
+  return /api\.deepseek\.(?:com|cn)(?:[:/]|$)/i.test(config.customEndpoint)
 }
 
-function isQwenThinkingModel(model: string): boolean {
-  return /qwen[-_]?3/i.test(model)
+function supportsDeepSeekThinkingParam(config: LlmConfig): boolean {
+  return /deepseek[-_]?v4/i.test(config.model)
 }
 
 function isKimiEndpoint(config: LlmConfig): boolean {
-  return /(^|[/:.-])kimi([/:.-]|$)/i.test(config.model)
-    || /moonshot/i.test(config.model)
-    || /api\.moonshot\.(ai|cn)/i.test(config.customEndpoint)
+  return /api\.moonshot\.(ai|cn)(?:[:/]|$)/i.test(config.customEndpoint)
+    || /api\.kimi\.com\/coding(?:\/|$)/i.test(config.customEndpoint)
 }
 
 function isXiaomiMimoEndpoint(config: LlmConfig): boolean {
-  return /(^|[/:.-])mimo([/:.-]|$)/i.test(config.model)
-    || /\.?xiaomimimo\.com(?::|\/|$)/i.test(config.customEndpoint)
+  return /\.?xiaomimimo\.com(?::|\/|$)/i.test(config.customEndpoint)
+}
+
+function isBigModelEndpoint(config: LlmConfig): boolean {
+  return /(?:^|\/\/)open\.bigmodel\.cn(?:[:/]|$)/i.test(config.customEndpoint)
+}
+
+function isGlmVisionModel(model: string): boolean {
+  const normalized = model.trim().toLowerCase()
+  return /(?:^|[-_.])glm[-_.]5v[-_.]turbo(?:[-_.]|$)/i.test(normalized)
+    || /(?:^|[-_.])glm[-_.]4\.?6v(?:[-_.]|$)/i.test(normalized)
+    || /(?:^|[-_.])glm[-_.]4\.?5v(?:[-_.]|$)/i.test(normalized)
+    || /(?:^|[-_.])glm[-_.]4v(?:[-_.]|$)/i.test(normalized)
 }
 
 function isOpenAiStrictCompletionModel(config: LlmConfig): boolean {
@@ -329,31 +451,72 @@ function buildOpenAiCompatibleBody(
   config: LlmConfig,
   messages: ChatMessage[],
   overrides?: RequestOverrides,
+  streaming = true,
 ): Record<string, unknown> {
+  assertBigModelImageSupport(config, messages)
   const reasoning = effectiveReasoning(config, overrides)
-  const body: Record<string, unknown> = buildOpenAiBody(messages, stripWireAgnosticOverrides(overrides))
+  const body: Record<string, unknown> = buildOpenAiBody(
+    messages,
+    stripWireAgnosticOverrides(overrides),
+    streaming,
+  )
   adaptOpenAiStrictCompletionBody(config, body)
   adaptKimiBody(config, body)
   adaptXiaomiMimoBody(config, body, reasoning)
+
+  if (config.provider === "custom" && isOpenRouterEndpoint(config.customEndpoint)) {
+    if (reasoning.mode === "custom" && reasoning.budgetTokens !== undefined) {
+      body.reasoning = { max_tokens: reasoning.budgetTokens }
+    } else if (reasoning.mode !== "auto") {
+      body.reasoning = { effort: reasoning.mode === "off" ? "none" : reasoning.mode }
+    }
+    return body
+  }
 
   if (isDeepSeekEndpoint(config)) {
     // DeepSeek V4 thinking mode. `thinking.type=disabled` is the most
     // important path for ingestion/rewrite tasks: it prevents the model
     // from spending the whole response on `reasoning_content` with no
     // final `content`.
-    if (reasoning.mode === "off") {
-      body.thinking = { type: "disabled" }
-    } else if (reasoning.mode !== "auto") {
-      body.thinking = { type: "enabled" }
-      if (reasoning.mode === "high" || reasoning.mode === "max") {
-        body.reasoning_effort = reasoning.mode
+    if (supportsDeepSeekThinkingParam(config)) {
+      if (reasoning.mode === "off") {
+        body.thinking = { type: "disabled" }
+      } else if (reasoning.mode !== "auto") {
+        body.thinking = { type: "enabled" }
+        if (reasoning.mode === "high" || reasoning.mode === "max") {
+          body.reasoning_effort = reasoning.mode
+        }
       }
     }
     return body
   }
 
-  if (reasoning.mode === "off" && isQwenThinkingModel(config.model)) {
-    body.chat_template_kwargs = { enable_thinking: false }
+  if (config.provider === "ollama") {
+    // Ollama's OpenAI-compatible /v1/chat/completions maps reasoning
+    // control onto `reasoning_effort` ("high"|"medium"|"low"|"none";
+    // "none" disables thinking). This is the only lever that stops a
+    // thinking-capable model — or a non-thinking one Ollama wraps with a
+    // thinking template — from spending its entire token budget on
+    // chain-of-thought and ending the stream with an empty `content`,
+    // which surfaces to the user as the "produced N chars of reasoning,
+    // but no actual response content" diagnostic. Until this, callers'
+    // `reasoning: { mode: "off" }` (every structured ingest call) was
+    // silently dropped on the Ollama path. Non-thinking models (gemma,
+    // llama) ignore the field harmlessly. "max" has no Ollama analogue,
+    // so it maps to the strongest supported level, "high".
+    // See docs.ollama.com/api/openai-compatibility.
+    if (reasoning.mode === "off") {
+      body.reasoning_effort = "none"
+    } else if (
+      reasoning.mode === "low" ||
+      reasoning.mode === "medium" ||
+      reasoning.mode === "high"
+    ) {
+      body.reasoning_effort = reasoning.mode
+    } else if (reasoning.mode === "max") {
+      body.reasoning_effort = "high"
+    }
+    return body
   }
 
   if (config.provider === "openai" && reasoning.mode !== "auto" && reasoning.mode !== "off") {
@@ -371,11 +534,10 @@ function buildOpenAiCompatibleBody(
  * block, and uses a different shape than OpenAI for images
  * (`source.media_type` + `source.data` instead of a `data:` URL).
  *
- * For system messages, Anthropic accepts the top-level `system`
- * field as a string OR as a content-block array. We always
- * stringify system content here because every existing system-
- * prompt call site sends a string and the round-trip through
- * blocks is lossy.
+ * System messages are flattened separately into the top-level
+ * `system` field. Anthropic accepts that field as either a string or a
+ * text-block array; we use the block array form there so the system
+ * prompt can opt into prompt caching.
  */
 function toAnthropicContent(content: string | ContentBlock[]): unknown {
   if (typeof content === "string") return content
@@ -396,7 +558,7 @@ function toAnthropicContent(content: string | ContentBlock[]): unknown {
 }
 
 /**
- * Anthropic's top-level `system` field is a string, not blocks.
+ * Anthropic's top-level `system` field accepts a string or text blocks.
  * If a caller puts images inside a system message we drop them —
  * Anthropic doesn't accept system-level images today, and silently
  * losing them is the lesser evil compared to the request 400ing
@@ -409,17 +571,33 @@ function flattenAnthropicSystem(content: string | ContentBlock[]): string {
     .join("")
 }
 
+function buildAnthropicSystem(systemText: string): unknown[] | undefined {
+  if (!systemText) return undefined
+  // Anthropic Messages wire only. OpenAI/Gemini-compatible providers
+  // use different system-prompt shapes and do not understand this
+  // cache_control marker.
+  return [
+    {
+      type: "text",
+      text: systemText,
+      cache_control: { type: "ephemeral" },
+    },
+  ]
+}
+
 function buildAnthropicBody(
   messages: ChatMessage[],
   overrides?: RequestOverrides,
+  streaming = true,
 ): Record<string, unknown> {
   const systemMessages = messages.filter((m) => m.role === "system")
   const conversationMessages = messages
     .filter((m) => m.role !== "system")
     .map((m) => ({ role: m.role, content: toAnthropicContent(m.content) }))
-  const system =
-    systemMessages.map((m) => flattenAnthropicSystem(m.content)).join("\n") ||
-    undefined
+  const systemText = systemMessages
+    .map((m) => flattenAnthropicSystem(m.content))
+    .join("\n")
+  const system = buildAnthropicSystem(systemText)
 
   // Anthropic Messages uses top_p / top_k (Python-style snake_case), a
   // mandatory `max_tokens`, and `stop_sequences` instead of `stop`.
@@ -427,7 +605,7 @@ function buildAnthropicBody(
   return {
     messages: conversationMessages,
     ...(system !== undefined ? { system } : {}),
-    stream: true,
+    stream: streaming,
     max_tokens: overrides?.max_tokens ?? 4096,
     ...(overrides?.temperature !== undefined ? { temperature: overrides.temperature } : {}),
     ...(overrides?.top_p !== undefined ? { top_p: overrides.top_p } : {}),
@@ -442,10 +620,25 @@ function buildAnthropicBodyWithReasoning(
   config: LlmConfig,
   messages: ChatMessage[],
   overrides?: RequestOverrides,
+  streaming = true,
 ): Record<string, unknown> {
-  const body = buildAnthropicBody(messages, overrides)
+  const body = buildAnthropicBody(messages, overrides, streaming)
   const reasoning = effectiveReasoning(config, overrides)
   if (reasoning.mode === "auto" || reasoning.mode === "off") return body
+
+  if (isAdaptiveAnthropicModel(config)) {
+    body.thinking = { type: "adaptive" }
+    const effort = reasoning.mode === "custom"
+      ? "high"
+      : reasoning.mode === "max"
+        ? "max"
+        : reasoning.mode
+    body.output_config = { effort }
+    delete body.temperature
+    delete body.top_p
+    delete body.top_k
+    return body
+  }
 
   const budget =
     reasoning.mode === "custom" && reasoning.budgetTokens !== undefined
@@ -464,6 +657,12 @@ function buildAnthropicBodyWithReasoning(
   delete body.top_p
   delete body.top_k
   return body
+}
+
+function hasImageContent(messages: ChatMessage[]): boolean {
+  return messages.some((m) =>
+    Array.isArray(m.content) && m.content.some((block) => block.type === "image"),
+  )
 }
 
 /**
@@ -489,8 +688,84 @@ function requiresBearerAuth(url: string): boolean {
     normalized.startsWith("https://coding.dashscope.aliyuncs.com/apps/anthropic") ||
     // Xiaomi MiMo Token Plan Anthropic gateway authenticates with
     // Authorization Bearer, matching its OpenAI-compatible gateway.
-    /(^https:\/\/|^)token-plan-cn\.xiaomimimo\.com\/anthropic(?:\/|$)/i.test(normalized)
+    /(^https:\/\/|^)token-plan-cn\.xiaomimimo\.com\/anthropic(?:\/|$)/i.test(normalized) ||
+    // Kimi Coding Plan — uses Authorization: Bearer, not x-api-key.
+    // The coding endpoint (api.kimi.com/coding) is separate from the
+    // Moonshot open platform (api.moonshot.ai) and expects Bearer auth
+    // on both its OpenAI- and Anthropic-compatible wires.
+    normalized.startsWith("https://api.kimi.com/coding") ||
+    // Moonshot open platform Anthropic-compatible wires (global + CN)
+    // also authenticate with Bearer tokens, matching their OpenAI wire.
+    normalized.startsWith("https://api.moonshot.ai/anthropic") ||
+    normalized.startsWith("https://api.moonshot.cn/anthropic")
   )
+}
+
+function isMiniMaxAnthropicHost(url: string): boolean {
+  try {
+    const parsed = new URL(url)
+    return parsed.hostname === "api.minimax.io" || parsed.hostname === "api.minimaxi.com"
+  } catch {
+    return false
+  }
+}
+
+function normalizeMiniMaxAnthropicBase(base: string): string {
+  if (!isMiniMaxAnthropicHost(base)) return base
+
+  try {
+    const parsed = new URL(base)
+    const path = parsed.pathname.replace(/\/+$/, "")
+    if (path === "" || path === "/" || /^\/v\d+(?:\/messages)?$/i.test(path)) {
+      parsed.pathname = "/anthropic"
+      parsed.search = ""
+      parsed.hash = ""
+      return parsed.toString().replace(/\/+$/, "")
+    }
+  } catch {
+    return base
+  }
+
+  return base
+}
+
+function isOfficialMiniMaxAnthropicUrl(url: string): boolean {
+  if (!isMiniMaxAnthropicHost(url)) return false
+  try {
+    const parsed = new URL(url)
+    return /^\/anthropic(?:\/|$)/i.test(parsed.pathname)
+  } catch {
+    return false
+  }
+}
+
+function isMiniMaxM3Model(model: string): boolean {
+  return /^minimax-m3(?:[-_.]|$)/i.test(model.trim())
+}
+
+function assertMiniMaxImageSupport(url: string, model: string, messages: ChatMessage[]): void {
+  if (!isOfficialMiniMaxAnthropicUrl(url) || !hasImageContent(messages) || isMiniMaxM3Model(model)) return
+  throw new Error(
+    "MiniMax image input is supported only by MiniMax-M3 on the official Anthropic-compatible endpoint. Switch the model to MiniMax-M3 or use another vision-capable provider.",
+  )
+}
+
+function assertBigModelImageSupport(config: LlmConfig, messages: ChatMessage[]): void {
+  if (!isBigModelEndpoint(config) || !hasImageContent(messages) || isGlmVisionModel(config.model)) return
+  throw new Error(
+    "Zhipu BigModel image input is supported only by GLM vision models. Switch to glm-5v-turbo, glm-4.6v, glm-4.5v, or glm-4v-plus.",
+  )
+}
+
+export function supportsImageInput(config: LlmConfig): boolean {
+  if (config.provider === "codex-cli") return false
+  if (config.provider === "minimax") return isMiniMaxM3Model(config.model)
+  if (isBigModelEndpoint(config)) return isGlmVisionModel(config.model)
+  if ((config.provider === "custom") && (config.apiMode ?? "chat_completions") === "anthropic_messages") {
+    const url = buildAnthropicUrl(config.customEndpoint)
+    return !isOfficialMiniMaxAnthropicUrl(url) || isMiniMaxM3Model(config.model)
+  }
+  return true
 }
 
 /**
@@ -507,24 +782,25 @@ function requiresBearerAuth(url: string): boolean {
  * ".../v1/v1/messages" (404) whenever a user typed a URL ending in /v1.
  */
 export function buildAnthropicUrl(base: string): string {
-  const trimmed = base.replace(/\/+$/, "")
+  const trimmed = normalizeMiniMaxAnthropicBase(base).replace(/\/+$/, "")
   if (/\/v\d+\/messages$/i.test(trimmed)) return trimmed
   if (/\/v\d+$/i.test(trimmed)) return `${trimmed}/messages`
   return `${trimmed}/v1/messages`
 }
 
-function buildAnthropicHeaders(apiKey: string, url: string): Record<string, string> {
+function buildAnthropicHeaders(config: LlmConfig, url: string): Record<string, string> {
+  const apiKey = config.apiKey
   const base: Record<string, string> = {
     "Content-Type": JSON_CONTENT_TYPE,
+    "anthropic-version": "2023-06-01",
   }
   if (requiresBearerAuth(url)) {
     base.Authorization = `Bearer ${apiKey}`
   } else {
     base["x-api-key"] = apiKey
-    base["anthropic-version"] = "2023-06-01"
     base["anthropic-dangerous-direct-browser-access"] = "true"
   }
-  return base
+  return mergeLlmRequestHeaders(config.customHeaders, base)
 }
 
 /**
@@ -553,6 +829,7 @@ function flattenGoogleSystemParts(content: string | ContentBlock[]): string {
 }
 
 function buildGoogleBody(
+  config: LlmConfig,
   messages: ChatMessage[],
   overrides?: RequestOverrides,
 ): Record<string, unknown> {
@@ -592,18 +869,26 @@ function buildGoogleBody(
   if (overrides?.stop !== undefined) {
     generationConfig.stopSequences = Array.isArray(overrides.stop) ? overrides.stop : [overrides.stop]
   }
-  if (overrides?.reasoning?.mode === "off") {
+  const reasoning = effectiveReasoning(config, overrides)
+  if (reasoning.mode === "off") {
     generationConfig.thinkingConfig = { thinkingBudget: 0 }
-  } else if (overrides?.reasoning && overrides.reasoning.mode !== "auto") {
-    const budget =
-      overrides.reasoning.mode === "custom" && overrides.reasoning.budgetTokens !== undefined
-        ? overrides.reasoning.budgetTokens
-        : overrides.reasoning.mode === "low"
-          ? 1024
-          : overrides.reasoning.mode === "medium"
-            ? 4096
-            : 8192
-    generationConfig.thinkingConfig = { thinkingBudget: budget }
+  } else if (reasoning.mode !== "auto") {
+    if (isGeminiThinkingLevelModel(config)) {
+      const thinkingLevel = reasoning.mode === "low" || reasoning.mode === "medium"
+        ? reasoning.mode
+        : "high"
+      generationConfig.thinkingConfig = { thinkingLevel }
+    } else {
+      const budget =
+        reasoning.mode === "custom" && reasoning.budgetTokens !== undefined
+          ? reasoning.budgetTokens
+          : reasoning.mode === "low"
+            ? 1024
+            : reasoning.mode === "medium"
+              ? 4096
+              : 8192
+      generationConfig.thinkingConfig = { thinkingBudget: budget }
+    }
   }
 
   return {
@@ -613,34 +898,61 @@ function buildGoogleBody(
   }
 }
 
+/**
+ * Convert the character-based response reserve into an Anthropic output-token
+ * limit. The lower bound is defensive: settings UI enforces a useful context
+ * size, but migrated or hand-edited persisted configuration must never produce
+ * the protocol-invalid `max_tokens: 0` value.
+ */
+export function deriveAnthropicMaxTokens(maxContextSize: number | undefined): number {
+  const { responseReserve } = computeContextBudget(maxContextSize)
+  return Math.max(1, Math.min(16_384, Math.floor(responseReserve / 3)))
+}
+
 export function getProviderConfig(config: LlmConfig): ProviderConfig {
   const { provider, apiKey, model, ollamaUrl, customEndpoint } = config
+  const streaming = config.streamingEnabled !== false
+
+  // Default max_tokens for Anthropic-wire providers, derived from the
+  // configured context window rather than a hardcoded 4096. Converts the
+  // character-based responseReserve to tokens at ~3 chars/token and caps
+  // at 16 384 to stay within typical per-request limits. Explicit
+  // overrides from callers (e.g. max_tokens: 300 for routing decisions)
+  // always take precedence because they are spread after this value.
+  const anthropicBudgetTokens = deriveAnthropicMaxTokens(config.maxContextSize)
 
   switch (provider) {
     case "openai":
       return {
         url: "https://api.openai.com/v1/chat/completions",
-        headers: {
+        headers: mergeLlmRequestHeaders(config.customHeaders, {
           "Content-Type": JSON_CONTENT_TYPE,
           Authorization: `Bearer ${apiKey}`,
-        },
+        }),
         buildBody: (messages, overrides) => ({
-          ...buildOpenAiCompatibleBody(config, messages, overrides),
+          ...buildOpenAiCompatibleBody(config, messages, overrides, streaming),
           model,
         }),
         parseStream: parseOpenAiLine,
+        parseResponse: parseOpenAiResponse,
+        streaming,
       }
 
     case "anthropic": {
       const url = buildAnthropicUrl("https://api.anthropic.com")
       return {
         url,
-        headers: buildAnthropicHeaders(apiKey, url),
-        buildBody: (messages, overrides) => ({
-          ...buildAnthropicBodyWithReasoning(config, messages, overrides),
-          model,
-        }),
+        headers: buildAnthropicHeaders(config, url),
+        buildBody: (messages, overrides) => {
+          assertMiniMaxImageSupport(url, model, messages)
+          return {
+            ...buildAnthropicBodyWithReasoning(config, messages, { max_tokens: anthropicBudgetTokens, ...overrides }, streaming),
+            model,
+          }
+        },
         parseStream: parseAnthropicLine,
+        parseResponse: parseAnthropicResponse,
+        streaming,
       }
     }
 
@@ -651,16 +963,20 @@ export function getProviderConfig(config: LlmConfig): ProviderConfig {
       // handles that plus any other path-illegal characters.
       const encodedModel = encodeURIComponent(model)
       return {
-        url: `https://generativelanguage.googleapis.com/v1beta/models/${encodedModel}:streamGenerateContent?alt=sse`,
-        headers: {
+        url: streaming
+          ? `https://generativelanguage.googleapis.com/v1beta/models/${encodedModel}:streamGenerateContent?alt=sse`
+          : `https://generativelanguage.googleapis.com/v1beta/models/${encodedModel}:generateContent`,
+        headers: mergeLlmRequestHeaders(config.customHeaders, {
           "Content-Type": JSON_CONTENT_TYPE,
           "x-goog-api-key": apiKey,
-        },
-        buildBody: (messages, overrides) => buildGoogleBody(messages, {
+        }),
+        buildBody: (messages, overrides) => buildGoogleBody(config, messages, {
           ...(overrides ?? {}),
           reasoning: effectiveReasoning(config, overrides),
         }),
         parseStream: parseGoogleLine,
+        parseResponse: parseGoogleResponse,
+        streaming,
       }
     }
 
@@ -671,13 +987,15 @@ export function getProviderConfig(config: LlmConfig): ProviderConfig {
           model,
           config.azureApiVersion ?? AZURE_OPENAI_API_VERSION,
         ),
-        headers: {
+        headers: mergeLlmRequestHeaders(config.customHeaders, {
           "Content-Type": JSON_CONTENT_TYPE,
           "api-key": apiKey,
-        },
+        }),
         buildBody: (messages, overrides) =>
-          buildOpenAiCompatibleBody(config, messages, overrides),
+          buildOpenAiCompatibleBody(config, messages, overrides, streaming),
         parseStream: parseOpenAiLine,
+        parseResponse: parseOpenAiResponse,
+        streaming,
       }
     }
 
@@ -694,15 +1012,17 @@ export function getProviderConfig(config: LlmConfig): ProviderConfig {
       }
       return {
         url: `${ollamaBase}/v1/chat/completions`,
-        headers: {
+        headers: mergeLlmRequestHeaders(config.customHeaders, {
           "Content-Type": JSON_CONTENT_TYPE,
           ...localLlmOriginHeader(),
-        },
+        }),
         buildBody: (messages, overrides) => ({
-          ...buildOpenAiCompatibleBody(config, messages, overrides),
+          ...buildOpenAiCompatibleBody(config, messages, overrides, streaming),
           model,
         }),
         parseStream: parseOpenAiLine,
+        parseResponse: parseOpenAiResponse,
+        streaming,
       }
     }
 
@@ -715,12 +1035,17 @@ export function getProviderConfig(config: LlmConfig): ProviderConfig {
       const url = buildAnthropicUrl(customEndpoint || "https://api.minimax.io/anthropic")
       return {
         url,
-        headers: buildAnthropicHeaders(apiKey, url),
-        buildBody: (messages, overrides) => ({
-          ...buildAnthropicBodyWithReasoning(config, messages, overrides),
-          model,
-        }),
+        headers: buildAnthropicHeaders(config, url),
+        buildBody: (messages, overrides) => {
+          assertMiniMaxImageSupport(url, model, messages)
+          return {
+            ...buildAnthropicBodyWithReasoning(config, messages, { max_tokens: anthropicBudgetTokens, ...overrides }, streaming),
+            model,
+          }
+        },
         parseStream: parseAnthropicLine,
+        parseResponse: parseAnthropicResponse,
+        streaming,
       }
     }
 
@@ -744,12 +1069,17 @@ export function getProviderConfig(config: LlmConfig): ProviderConfig {
         const url = buildAnthropicUrl(customEndpoint)
         return {
           url,
-          headers: buildAnthropicHeaders(apiKey, url),
-          buildBody: (messages, overrides) => ({
-            ...buildAnthropicBodyWithReasoning(config, messages, overrides),
-            model,
-          }),
+          headers: buildAnthropicHeaders(config, url),
+          buildBody: (messages, overrides) => {
+            assertMiniMaxImageSupport(url, model, messages)
+            return {
+              ...buildAnthropicBodyWithReasoning(config, messages, { max_tokens: anthropicBudgetTokens, ...overrides }, streaming),
+              model,
+            }
+          },
           parseStream: parseAnthropicLine,
+          parseResponse: parseAnthropicResponse,
+          streaming,
         }
       }
       // Defense-in-depth: settings-side EndpointField normalizes URLs on
@@ -769,24 +1099,27 @@ export function getProviderConfig(config: LlmConfig): ProviderConfig {
       const azure = isAzureOpenAiEndpoint(url)
       return {
         url,
-        headers: {
+        headers: mergeLlmRequestHeaders(config.customHeaders, {
           "Content-Type": JSON_CONTENT_TYPE,
           ...(apiKey
             ? azure
               ? { "api-key": apiKey }
               : { Authorization: `Bearer ${apiKey}` }
             : {}),
-          // Local OpenAI-compatible servers (LM Studio, llama.cpp,
-          // vLLM, LocalAI) often share Ollama's CORS sensitivity.
-          // Same rationale as the `ollama` branch above.
-          ...(azure ? {} : localLlmOriginHeader()),
-        },
+          // Only local/LAN OpenAI-compatible servers (LM Studio,
+          // llama.cpp, vLLM, LocalAI) need the Ollama-style Origin
+          // workaround. Public custom gateways may reject unexpected
+          // browser Origin headers, so leave them untouched.
+          ...(!azure && isLocalOrPrivateHttpEndpoint(url) ? localLlmOriginHeader() : {}),
+        }),
         buildBody: (messages, overrides) => {
-          const body = buildOpenAiCompatibleBody(config, messages, overrides)
+          const body = buildOpenAiCompatibleBody(config, messages, overrides, streaming)
           if (!azure) body.model = model
           return body
         },
         parseStream: parseOpenAiLine,
+        parseResponse: parseOpenAiResponse,
+        streaming,
       }
     }
 

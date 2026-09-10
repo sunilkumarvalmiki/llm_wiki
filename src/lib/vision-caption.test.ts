@@ -103,7 +103,11 @@ describe("captionImage", () => {
     })
 
     const overrides = mockStreamChat.mock.calls[0][4]
-    expect(overrides).toEqual({ temperature: 0.3, max_tokens: 256 })
+    expect(overrides).toEqual({
+      temperature: 0.3,
+      max_tokens: 256,
+      reasoning: { mode: "off" },
+    })
   })
 
   it("uses defaults (temp=0, max_tokens=4096) when no options passed", async () => {
@@ -114,7 +118,38 @@ describe("captionImage", () => {
     await captionImage(TINY_B64, "image/png", cfg)
 
     const overrides = mockStreamChat.mock.calls[0][4]
-    expect(overrides).toEqual({ temperature: 0, max_tokens: 4096 })
+    expect(overrides).toEqual({
+      temperature: 0,
+      max_tokens: 4096,
+      reasoning: { mode: "off" },
+    })
+  })
+
+  it("forces reasoning off so main reasoning models produce captions instead of thinking-only streams", async () => {
+    mockStreamChat.mockImplementation(async (_c, _m, cb) => {
+      cb.onToken("caption")
+      cb.onDone()
+    })
+
+    const reasoningCfg: LlmConfig = {
+      ...cfg,
+      reasoning: { mode: "high" },
+    }
+    await captionImage(TINY_B64, "image/png", reasoningCfg)
+
+    expect(mockStreamChat.mock.calls[0][4]).toMatchObject({
+      reasoning: { mode: "off" },
+    })
+  })
+
+  it("rejects Codex CLI captioning because that transport omits image bytes", async () => {
+    await expect(
+      captionImage(TINY_B64, "image/png", {
+        ...cfg,
+        provider: "codex-cli",
+      }),
+    ).rejects.toThrow(/does not support image input/)
+    expect(mockStreamChat).not.toHaveBeenCalled()
   })
 
   it("forwards the AbortSignal to streamChat (lets callers cancel batch captioning)", async () => {
@@ -136,6 +171,46 @@ describe("captionImage", () => {
     expect(CAPTION_PROMPT).toMatch(/visible text verbatim/)
     expect(CAPTION_PROMPT).toMatch(/Do NOT speculate/)
     expect(CAPTION_PROMPT).toMatch(/no markdown/)
+  })
+
+  it("adds the configured caption language while preserving visible source text", async () => {
+    await captionImage(TINY_B64, "image/png", cfg, undefined, {
+      outputLanguage: "German",
+    })
+    const messages = mockStreamChat.mock.calls[0]?.[1] as ChatMessage[]
+    const textBlock = Array.isArray(messages?.[0]?.content)
+      ? messages[0].content[0]
+      : null
+    expect(textBlock).toMatchObject({ type: "text" })
+    if (!textBlock || textBlock.type !== "text") {
+      throw new Error("expected text prompt block")
+    }
+    expect(textBlock.text).toContain("Write the description in German")
+    expect(textBlock.text).toContain("Preserve visible text verbatim")
+  })
+
+  it("appends the language instruction to the context-aware prompt too", async () => {
+    await captionImage(TINY_B64, "image/png", cfg, undefined, {
+      contextBefore: "Figure 3: Q2 revenue chart",
+      outputLanguage: "German",
+    })
+    const messages = mockStreamChat.mock.calls[0]?.[1] as ChatMessage[]
+    const blocks = messages[0].content as Array<{ type: string; text?: string }>
+    const promptText = blocks[0].text ?? ""
+    expect(promptText).toContain("Figure 3: Q2 revenue chart")
+    expect(promptText).toContain("Write the description in German")
+  })
+
+  it('treats "auto" (and absent) outputLanguage as no language directive', async () => {
+    await captionImage(TINY_B64, "image/png", cfg, undefined, {
+      outputLanguage: "auto",
+    })
+    const messages = mockStreamChat.mock.calls[0]?.[1] as ChatMessage[]
+    const blocks = messages[0].content as Array<{ type: string; text?: string }>
+    // "auto" means "follow the source" — resolving it is the caller's
+    // job (ingest resolves via detectLanguage), so here it must fall
+    // back to the unmodified prompt rather than "Write in auto".
+    expect(blocks[0].text).toBe(CAPTION_PROMPT)
   })
 
   it("uses the no-context prompt when context is empty / whitespace-only", async () => {
